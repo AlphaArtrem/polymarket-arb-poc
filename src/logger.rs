@@ -121,7 +121,7 @@ pub async fn log_evaluations(
     if !csv_path.exists() {
         append_csv_line(
             &csv_path,
-            "timestamp,binance_to_decision_us,poly_to_decision_us,decision_duration_us",
+            "timestamp,binance_to_decision_us,poly_to_decision_us,decision_duration_us,simulated_order_delay_ms",
         );
     }
 
@@ -135,11 +135,12 @@ pub async fn log_evaluations(
                         append_jsonl(&eval_path, &e);
                         let poly_us = e.poly_to_decision_us.map_or("".to_string(), |v| v.to_string());
                         let csv_line = format!(
-                            "{},{},{},{}",
+                            "{},{},{},{},{}",
                             e.timestamp,
                             e.binance_to_decision_us,
                             poly_us,
-                            e.decision_duration_us
+                            e.decision_duration_us,
+                            e.simulated_order_delay_ms
                         );
                         append_csv_line(&csv_path, &csv_line);
                     }

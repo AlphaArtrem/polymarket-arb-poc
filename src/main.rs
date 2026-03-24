@@ -81,12 +81,14 @@ async fn main() {
     let clob_state = poly_state.clone();
     let clob_snapshot_tx = snapshot_tx.clone();
     let clob_resolution_tx = resolution_tx.clone();
+    let max_levels = config.execution.max_levels;
     tokio::spawn(async move {
         polymarket_feed::run_clob_ws(
             clob_state,
             clob_snapshot_tx,
             clob_resolution_tx,
             sub_rx,
+            max_levels,
             clob_cancel,
         )
         .await;
@@ -95,17 +97,25 @@ async fn main() {
     // Spawn strategy engine
     let strat_cancel = cancel.clone();
     let strat_tick_rx = tick_tx.subscribe();
+    let strat_snapshot_rx = snapshot_tx.subscribe();
     let strat_poly_state = poly_state.clone();
     let strat_app_state = app_state.clone();
     let strat_eval_tx = eval_tx.clone();
     let strat_trade_tx = trade_tx.clone();
     let threshold = config.strategy.threshold;
     let trade_size = config.strategy.trade_size;
+    let taker_fee_bps = config.execution.taker_fee_bps;
+    let slippage_bps = config.execution.slippage_bps;
+    let simulated_order_delay_ms = config.latency.simulated_order_delay_ms;
     tokio::spawn(async move {
         strategy::run_strategy(
             threshold,
             trade_size,
+            taker_fee_bps,
+            slippage_bps,
+            simulated_order_delay_ms,
             strat_tick_rx,
+            strat_snapshot_rx,
             strat_poly_state,
             strat_app_state,
             strat_eval_tx,

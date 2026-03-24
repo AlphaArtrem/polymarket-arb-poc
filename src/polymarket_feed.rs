@@ -1,4 +1,4 @@
-use crate::types::{ActiveMarket, MarketResolution, MarketSnapshot};
+use crate::types::{ActiveMarket, AskLevel, MarketResolution, MarketSnapshot};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
@@ -49,7 +49,6 @@ struct ClobEvent {
 #[derive(Debug, Deserialize)]
 struct OrderLevel {
     price: String,
-    #[allow(dead_code)]
     size: String,
 }
 
@@ -213,6 +212,8 @@ pub async fn run_market_discovery(
                         up_best_ask: None,
                         down_best_bid: None,
                         down_best_ask: None,
+                        up_ask_levels: Vec::new(),
+                        down_ask_levels: Vec::new(),
                         window_start: market.window_start,
                         window_end: market.window_end,
                         ts_last_update: now_ms(),
@@ -275,6 +276,7 @@ pub async fn run_clob_ws(
     snapshot_tx: broadcast::Sender<MarketSnapshot>,
     resolution_tx: broadcast::Sender<MarketResolution>,
     mut sub_rx: tokio::sync::mpsc::Receiver<SubscriptionUpdate>,
+    max_levels: usize,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     let ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
@@ -355,6 +357,7 @@ pub async fn run_clob_ws(
                                 &state,
                                 &snapshot_tx,
                                 &resolution_tx,
+                                max_levels,
                             ).await;
                         }
                         Some(Ok(tungstenite::Message::Close(_))) => {
@@ -418,6 +421,7 @@ async fn handle_clob_message(
     state: &Arc<RwLock<PolymarketState>>,
     snapshot_tx: &broadcast::Sender<MarketSnapshot>,
     resolution_tx: &broadcast::Sender<MarketResolution>,
+    max_levels: usize,
 ) {
     let event: ClobEvent = match serde_json::from_str(text) {
         Ok(e) => e,
@@ -480,7 +484,39 @@ async fn handle_clob_message(
                         })
                 });
 
+                // Extract ask levels sorted by price ascending, up to max_levels
+                let ask_levels: Vec<AskLevel> = if let Some(asks) = &event.asks {
+                    let mut levels: Vec<AskLevel> = asks
+                        .iter()
+                        .filter_map(|l| {
+                            let price = l.price.parse::<f64>().ok()?;
+                            let size = l.size.parse::<f64>().ok()?;
+                            Some(AskLevel { price, size })
+                        })
+                        .collect();
+                    levels.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+                    levels.truncate(max_levels);
+                    levels
+                } else {
+                    Vec::new()
+                };
+
                 let mut st = state.write().await;
+
+                // Store ask levels for this side
+                if let Some((symbol, side)) = st.token_map.get(asset_id).cloned() {
+                    if let Some(active) = st.active_markets.get(&symbol) {
+                        let cid = active.condition_id.clone();
+                        if let Some(snap) = st.snapshots.get_mut(&cid) {
+                            if side == "up" {
+                                snap.up_ask_levels = ask_levels;
+                            } else {
+                                snap.down_ask_levels = ask_levels;
+                            }
+                        }
+                    }
+                }
+
                 update_bid_ask_values(
                     &mut st,
                     asset_id,

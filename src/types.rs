@@ -11,6 +11,13 @@ pub struct UnderlyingTick {
     pub ts_receive: u64,
 }
 
+/// A single ask level from the order book.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskLevel {
+    pub price: f64,
+    pub size: f64,
+}
+
 /// Current best-bid/ask state for a Polymarket 15-min Up/Down market.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketSnapshot {
@@ -20,6 +27,8 @@ pub struct MarketSnapshot {
     pub up_best_ask: Option<f64>,
     pub down_best_bid: Option<f64>,
     pub down_best_ask: Option<f64>,
+    pub up_ask_levels: Vec<AskLevel>,
+    pub down_ask_levels: Vec<AskLevel>,
     pub window_start: u64,
     pub window_end: u64,
     pub ts_last_update: u64,
@@ -46,7 +55,16 @@ pub struct MockTrade {
     pub down_ask_price: f64,
     pub combined_ask: f64,
     pub trade_size: f64,
-    pub expected_profit: f64,
+    pub up_exec_price: f64,
+    pub down_exec_price: f64,
+    pub combined_exec: f64,
+    pub up_fee: f64,
+    pub down_fee: f64,
+    pub total_fee: f64,
+    pub expected_profit_gross: f64,
+    pub expected_profit_net: f64,
+    pub edge_positive: bool,
+    pub simulated_order_delay_ms: u64,
     pub ts_binance_receive: u64,
     pub ts_poly_last_update: u64,
     pub ts_decision_start: u64,
@@ -56,7 +74,8 @@ pub struct MockTrade {
     pub window_end: u64,
     pub settled: bool,
     pub winning_outcome: Option<String>,
-    pub actual_pnl: Option<f64>,
+    pub realized_profit: Option<f64>,
+    pub resolved_winner: Option<String>,
 }
 
 /// A strategy evaluation record (logged for every tick).
@@ -68,6 +87,13 @@ pub struct Evaluation {
     pub up_best_ask: Option<f64>,
     pub down_best_ask: Option<f64>,
     pub combined_ask: Option<f64>,
+    pub combined_exec: Option<f64>,
+    pub expected_profit_gross: Option<f64>,
+    pub expected_profit_net: Option<f64>,
+    pub edge_positive: bool,
+    pub up_depth_available: Option<f64>,
+    pub down_depth_available: Option<f64>,
+    pub simulated_order_delay_ms: u64,
     pub trade_triggered: bool,
     pub ts_binance_receive: u64,
     pub ts_poly_last_update: Option<u64>,
