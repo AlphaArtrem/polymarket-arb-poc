@@ -1,6 +1,8 @@
 # EC2 Deployment & Results Collection Guide
 ## Polymarket Crypto 15m Arb POC
 
+Workflow: build locally, push binary + config to EC2 via `scp`, run on EC2. No git or Rust toolchain needed on the VPS.
+
 ---
 
 ## 1. Launch EC2 Instance
@@ -10,7 +12,7 @@
 
 ### Instance Type
 **t4g.medium** (2 vCPU ARM Graviton, 4 GB RAM) — ~$0.0336/hr (~$0.81/day)
-- ARM/Graviton: Rust compiles natively, ~15-20% cheaper than x86
+- ARM/Graviton: ~15-20% cheaper than x86
 - 4 GB RAM is plenty for this POC (in-memory state is tiny)
 - Burstable CPU is fine — the bot is I/O-bound, not CPU-bound
 
@@ -31,30 +33,80 @@ Create or use an existing SSH key pair.
 
 ---
 
-## 2. Initial Setup (SSH in)
+## 2. Build Locally and Push to EC2
+
+### Prerequisites (your local machine)
+- Rust toolchain installed
+- If your local machine is x86 (Mac Intel / Linux x86) and EC2 is ARM (t4g/c7g), you need to cross-compile
+
+### Option A: Local machine is ARM (Mac Apple Silicon / Linux ARM)
 
 ```bash
-# SSH into your instance
-ssh -i your-key.pem ec2-user@<public-ip>
+# Clone and build locally
+git clone https://github.com/AlphaArtrem/polymarket-arb-poc.git
+cd polymarket-arb-poc
+cargo build --release
 
-# Update system
-sudo dnf update -y
+# Push binary + config to EC2
+scp -i your-key.pem target/release/polymarket-arb-poc ec2-user@<public-ip>:~/
+scp -i your-key.pem config.toml ec2-user@<public-ip>:~/
+```
 
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source ~/.cargo/env
+### Option B: Local machine is x86 — cross-compile for ARM
 
-# Install build essentials (needed for native-tls / openssl)
-sudo dnf install -y gcc openssl-devel pkg-config git
+```bash
+# Install the ARM target
+rustup target add aarch64-unknown-linux-gnu
 
-# Verify
-rustc --version
-cargo --version
+# On macOS, install the cross-compilation linker
+brew install messense/macos-cross-toolchains/aarch64-unknown-linux-gnu
+# Or use 'cross' (Docker-based, works on any OS):
+cargo install cross
+
+# Clone and cross-compile
+git clone https://github.com/AlphaArtrem/polymarket-arb-poc.git
+cd polymarket-arb-poc
+
+# Using cross (easiest, requires Docker):
+cross build --release --target aarch64-unknown-linux-gnu
+
+# Push the ARM binary + config to EC2
+scp -i your-key.pem target/aarch64-unknown-linux-gnu/release/polymarket-arb-poc ec2-user@<public-ip>:~/
+scp -i your-key.pem config.toml ec2-user@<public-ip>:~/
+```
+
+### Option C: Use an x86 EC2 instance instead
+
+If cross-compiling is a hassle, just launch a **t3.medium** (x86) instead of t4g. Then build natively on your x86 local machine:
+
+```bash
+cargo build --release
+scp -i your-key.pem target/release/polymarket-arb-poc ec2-user@<public-ip>:~/
+scp -i your-key.pem config.toml ec2-user@<public-ip>:~/
 ```
 
 ---
 
-## 3. Configure NTP (Critical for Latency Measurement)
+## 3. EC2 Setup (SSH in)
+
+Only minimal setup needed — no Rust, no git.
+
+```bash
+ssh -i your-key.pem ec2-user@<public-ip>
+
+# Make binary executable (scp preserves permissions, but just in case)
+chmod +x ~/polymarket-arb-poc
+
+# Create logs directory
+mkdir -p ~/logs
+
+# Verify binary runs
+~/polymarket-arb-poc --help 2>&1 || echo "Binary is ready (no --help flag, will run with config.toml)"
+```
+
+---
+
+## 4. Configure NTP (Critical for Latency Measurement)
 
 Amazon Linux 2023 uses chrony with the local Amazon Time Sync Service by default. Verify it:
 
@@ -84,27 +136,12 @@ chronyc sources  # Should show PHC0 with * as preferred
 
 ---
 
-## 4. Clone, Build, Configure
+## 5. Tune Config (Optional)
+
+Edit `config.toml` on the EC2 instance if you want to adjust parameters:
 
 ```bash
-# Clone the repo
-git clone https://github.com/AlphaArtrem/polymarket-arb-poc.git
-cd polymarket-arb-poc
-
-# Build release binary (optimized)
-cargo build --release
-# This will take 2-5 minutes on t4g.medium
-
-# Verify binary exists
-ls -la target/release/polymarket-arb-poc
-```
-
-### Tune config.toml
-
-The default config is ready to go, but you may want to adjust:
-
-```bash
-vim config.toml
+vi ~/config.toml
 ```
 
 ```toml
@@ -119,16 +156,30 @@ threshold = 0.95    # Start conservative. We'll tune this after the run.
 min_size = 5.0
 trade_size = 10.0
 
+[execution]
+taker_fee_bps = 30        # fee per side in basis points
+slippage_bps = 10         # extra price impact in bps
+max_levels = 3            # book depth levels to consider
+
+[latency]
+simulated_order_delay_ms = 10  # simulated network delay to exchange
+
 [general]
 run_duration_secs = 86400  # 24 hours
 log_dir = "./logs"
 ```
 
+Or edit it locally before pushing:
+```bash
+# From your local machine — edit, then push updated config
+scp -i your-key.pem config.toml ec2-user@<public-ip>:~/
+```
+
 ---
 
-## 5. Pre-Flight Latency Check
+## 6. Pre-Flight Latency Check
 
-Before the 24-hour run, measure raw network latency:
+Before the 24-hour run, measure raw network latency from EC2:
 
 ```bash
 # Binance WebSocket endpoint
@@ -144,21 +195,23 @@ curl -o /dev/null -s -w "DNS: %{time_namelookup}s\nConnect: %{time_connect}s\nTT
   "https://gamma-api.polymarket.com/events?slug=btc-updown-15m-$(($(date +%s) / 900 * 900))"
 
 # Save these results
-echo "=== Pre-flight latency ===" > pre_flight.txt
-ping -c 20 stream.binance.com >> pre_flight.txt 2>&1
-ping -c 20 ws-subscriptions-clob.polymarket.com >> pre_flight.txt 2>&1
+echo "=== Pre-flight latency ===" > ~/pre_flight.txt
+ping -c 20 stream.binance.com >> ~/pre_flight.txt 2>&1
+ping -c 20 ws-subscriptions-clob.polymarket.com >> ~/pre_flight.txt 2>&1
 ```
 
 ---
 
-## 6. Run the 24-Hour Test
+## 7. Run the 24-Hour Test
 
 ```bash
+cd ~
+
 # Create a screen session (persists after SSH disconnect)
 screen -S arb
 
 # Run with info logging
-RUST_LOG=info ./target/release/polymarket-arb-poc 2>&1 | tee run.log
+RUST_LOG=info ./polymarket-arb-poc 2>&1 | tee run.log
 
 # Detach from screen: Ctrl-A then D
 # Reattach later: screen -r arb
@@ -166,8 +219,9 @@ RUST_LOG=info ./target/release/polymarket-arb-poc 2>&1 | tee run.log
 
 Alternative using nohup (simpler):
 ```bash
+cd ~
 mkdir -p logs
-RUST_LOG=info nohup ./target/release/polymarket-arb-poc > run.log 2>&1 &
+RUST_LOG=info nohup ./polymarket-arb-poc > run.log 2>&1 &
 echo $! > pid.txt
 
 # Check it's running
@@ -181,25 +235,27 @@ cat pid.txt | xargs ps -p
 
 ```bash
 # Watch trades in real-time
-tail -f logs/mock_trades.jsonl | python3 -m json.tool
+tail -f ~/logs/mock_trades.jsonl | python3 -m json.tool
 
 # Count trades so far
-wc -l logs/mock_trades.jsonl
+wc -l ~/logs/mock_trades.jsonl
 
 # Watch latest evaluations
-tail -1 logs/evaluations.jsonl | python3 -m json.tool
+tail -1 ~/logs/evaluations.jsonl | python3 -m json.tool
 
 # Quick latency check
-tail -100 logs/latency_metrics.csv | awk -F, '{sum+=$4; n++} END {print "Avg decision_duration_us:", sum/n}'
+tail -100 ~/logs/latency_metrics.csv | awk -F, '{sum+=$4; n++} END {print "Avg decision_duration_us:", sum/n}'
 ```
 
 ---
 
-## 7. After the Run — Collect Results
+## 8. After the Run — Collect Results
 
-### Package logs for analysis
+### On EC2: package logs
 
 ```bash
+cd ~
+
 # Check log sizes
 ls -lh logs/
 
@@ -214,22 +270,29 @@ echo "Mock trades: $(wc -l < logs/mock_trades.jsonl)"
 echo "Evaluations: $(wc -l < logs/evaluations.jsonl)"
 echo "Latency rows: $(wc -l < logs/latency_metrics.csv)"
 
-# Average combined_ask when trades triggered
+# Edge-positive trade summary
 python3 -c "
 import json
 trades = [json.loads(l) for l in open('logs/mock_trades.jsonl')]
 if trades:
-    avg = sum(t['combined_ask'] for t in trades) / len(trades)
-    total_pnl = sum(t['expected_profit'] for t in trades)
+    edge_pos = [t for t in trades if t.get('edge_positive')]
     print(f'Total trades: {len(trades)}')
-    print(f'Avg combined_ask: {avg:.4f}')
-    print(f'Total expected PnL: {total_pnl:.2f}')
-    print(f'Avg profit/trade: {total_pnl/len(trades):.4f}')
+    print(f'Edge-positive trades: {len(edge_pos)}')
+    avg_exec = sum(t['combined_exec'] for t in trades) / len(trades)
+    print(f'Avg combined_exec: {avg_exec:.4f}')
+    total_net = sum(t['expected_profit_net'] for t in trades)
+    print(f'Total expected net PnL: {total_net:.2f}')
+    settled = [t for t in trades if t.get('realized_profit') is not None]
+    if settled:
+        realized = sum(t['realized_profit'] for t in settled)
+        print(f'Settled trades: {len(settled)}')
+        print(f'Realized PnL: {realized:.2f}')
     by_sym = {}
     for t in trades:
         by_sym.setdefault(t['symbol'], []).append(t)
     for sym, ts in sorted(by_sym.items()):
-        print(f'  {sym}: {len(ts)} trades, avg combined_ask={sum(t[\"combined_ask\"] for t in ts)/len(ts):.4f}')
+        ep = [t for t in ts if t.get('edge_positive')]
+        print(f'  {sym}: {len(ts)} trades ({len(ep)} edge+), avg combined_exec={sum(t[\"combined_exec\"] for t in ts)/len(ts):.4f}')
 else:
     print('No trades triggered')
 "
@@ -256,16 +319,39 @@ if durations:
 "
 ```
 
-### Download to your local machine
+### Pull results to your local machine
 
 ```bash
 # From your local machine:
-scp -i your-key.pem ec2-user@<public-ip>:~/polymarket-arb-poc/results-*.tar.gz .
+scp -i your-key.pem ec2-user@<public-ip>:~/results-*.tar.gz .
 ```
 
 ---
 
-## 8. Share Results With Me
+## 9. Updating the Binary
+
+When there are code changes, rebuild locally and push the new binary:
+
+```bash
+# On your local machine:
+cd polymarket-arb-poc
+git pull
+cargo build --release   # or cross build for ARM
+
+# Push updated binary (stop the running bot first via SSH)
+scp -i your-key.pem target/release/polymarket-arb-poc ec2-user@<public-ip>:~/
+
+# SSH in and restart
+ssh -i your-key.pem ec2-user@<public-ip>
+# Kill old process if running:
+kill $(cat pid.txt) 2>/dev/null
+RUST_LOG=info nohup ./polymarket-arb-poc > run.log 2>&1 &
+echo $! > pid.txt
+```
+
+---
+
+## 10. Share Results With Me
 
 Upload these files and I'll analyze them and help tune the strategy:
 
@@ -281,26 +367,27 @@ Priority order:
 5. **`pre_flight.txt`** — raw ping latencies
 
 ### Option C: Paste the summary output
-If uploading isn't convenient, run the summary scripts from Section 7 and paste the output. That gives me enough to start tuning.
+If uploading isn't convenient, run the summary scripts from Section 8 and paste the output. That gives me enough to start tuning.
 
 ---
 
-## 9. What I'll Analyze
+## 11. What I'll Analyze
 
 With your results, I'll compute:
 
 1. **Opportunity frequency** — how many trades per hour, per symbol
-2. **Combined ask distribution** — histogram of `up_ask + down_ask` values
-3. **Latency budget** — is signal-to-decision within 40-80ms?
-4. **PnL projection** — expected profit at different fill assumptions (100%, 80%, 50%)
-5. **Threshold tuning** — should we tighten from 0.95 to 0.98? Or loosen?
-6. **Time-of-day patterns** — are opportunities clustered around specific hours?
-7. **Symbol comparison** — which assets have the best edge?
-8. **Next steps** — whether to proceed to live trading, and with what parameters
+2. **Combined exec distribution** — histogram of `up_exec + down_exec` values (after slippage)
+3. **Edge-positive rate** — what fraction of trades have `expected_profit_net > 0`
+4. **Latency budget** — is signal-to-decision within 40-80ms?
+5. **Realized PnL** — actual profit using Polymarket resolution, fees, slippage, and simulated delay
+6. **Threshold tuning** — should we tighten from 0.95 to 0.98? Or loosen?
+7. **Time-of-day patterns** — are opportunities clustered around specific hours?
+8. **Symbol comparison** — which assets have the best edge?
+9. **Next steps** — whether to proceed to live trading, and with what parameters
 
 ---
 
-## 10. Cost Estimate
+## 12. Cost Estimate
 
 | Item | Cost |
 |------|------|
@@ -317,11 +404,20 @@ Don't forget to **stop or terminate** the instance after collecting results.
 
 ### Binary won't start
 ```bash
+# Check architecture matches
+file ~/polymarket-arb-poc
+# Should show: ELF 64-bit ... ARM aarch64 (for t4g)
+# Or: ELF 64-bit ... x86-64 (for t3)
+
+# If architecture mismatch: rebuild for the correct target
 # Check if port/resource issues
 lsof -i :443
 # Check logs
 tail -50 run.log
 ```
+
+### "config.toml not found"
+The binary looks for `config.toml` in the current working directory. Make sure you `cd ~` before running, and that `config.toml` is in `~/`.
 
 ### No Polymarket data
 - Markets rotate every 15 min. The discovery task needs ~2 min to fetch the first market.
