@@ -9,6 +9,14 @@ threshold = 0.95
 min_size = 5.0
 trade_size = 10.0
 
+[execution]
+taker_fee_bps = 30
+slippage_bps = 10
+max_levels = 3
+
+[latency]
+simulated_order_delay_ms = 10
+
 [general]
 run_duration_secs = 86400
 log_dir = "./logs"

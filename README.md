@@ -40,11 +40,15 @@ Rust proof-of-concept for detecting and paper-trading arbitrage opportunities on
 On each Binance tick for a symbol:
 1. Read current Polymarket snapshot for the corresponding 15-min Up/Down market
 2. If `up_best_ask + down_best_ask <= threshold` (default 0.95):
-   - Log a mock pair trade (buy Up at ask + buy Down at ask)
-   - Expected profit = `(1.0 - combined_ask) * trade_size` per trade
+   - Check available depth: sum of ask level sizes must be >= trade_size for both Up and Down outcomes
+   - Apply configurable slippage (slippage_bps) to execution prices
+   - Compute taker fees per side (taker_fee_bps)
+   - Log profitability both gross (before fees) and net (after fees + slippage)
+   - `edge_positive` flag marks trades that would be profitable after all costs
+   - Log the mock trade regardless of edge_positive (to capture both positive and negative edges)
 3. Record all timestamps for latency analysis
 
-At market resolution, settle all open trades for that market: winner pays 1.0, loser pays 0.0.
+At market resolution, settle all open trades: realized PnL accounts for execution price (with slippage), taker fees, and simulated order delay.
 
 ## Latency Measurements
 
@@ -52,7 +56,12 @@ Every strategy evaluation records:
 - `binance_to_decision_us`: WebSocket receive → decision start (microseconds)
 - `poly_to_decision_us`: Last Polymarket update → decision start (microseconds)
 - `decision_duration_us`: Decision computation time (microseconds)
-- `ts_mock_order`: Timestamp of mock order creation
+- `simulated_order_delay_ms`: Configurable simulated order-send delay
+- `ts_mock_order = ts_decision_end + simulated_order_delay_ms`: The Polymarket snapshot used for execution pricing is the one closest to `ts_mock_order`, not `ts_decision_start`
+
+## PnL
+
+Settled using Polymarket's actual resolution outcome (Chainlink-based), not Binance price direction. Realized PnL accounts for execution price (with slippage), taker fees, and simulated order delay.
 
 ## Quick Start
 
@@ -84,6 +93,14 @@ threshold = 0.95    # combined Up_ask + Down_ask must be <= this
 min_size = 5.0      # minimum order size (Polymarket minimum)
 trade_size = 10.0   # fixed paper trade size per side
 
+[execution]
+taker_fee_bps = 30  # 0.30% taker fee per side
+slippage_bps = 10   # 0.10% slippage per side
+max_levels = 3      # number of ask levels to retain from order book
+
+[latency]
+simulated_order_delay_ms = 10  # simulated order-send delay in ms
+
 [general]
 run_duration_secs = 86400  # 24 hours
 log_dir = "./logs"
@@ -99,7 +116,7 @@ After a run, `./logs/` will contain:
 | `polymarket_snapshots.jsonl` | JSONL | Every Polymarket best bid/ask update |
 | `mock_trades.jsonl` | JSONL | All triggered mock trades with full timestamp chain |
 | `evaluations.jsonl` | JSONL | Every strategy evaluation (trade or no-trade) |
-| `latency_metrics.csv` | CSV | `timestamp, binance_to_decision_us, poly_to_decision_us, decision_duration_us` |
+| `latency_metrics.csv` | CSV | `timestamp, binance_to_decision_us, poly_to_decision_us, decision_duration_us, simulated_order_delay_ms` |
 
 ## Deployment (Dublin VPS)
 

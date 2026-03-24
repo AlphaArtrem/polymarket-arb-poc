@@ -6,6 +6,8 @@ pub struct Config {
     pub binance: BinanceConfig,
     pub polymarket: PolymarketConfig,
     pub strategy: StrategyConfig,
+    pub execution: ExecutionConfig,
+    pub latency: LatencyConfig,
     pub general: GeneralConfig,
 }
 
@@ -24,6 +26,18 @@ pub struct StrategyConfig {
     pub threshold: f64,
     pub min_size: f64,
     pub trade_size: f64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ExecutionConfig {
+    pub taker_fee_bps: f64,
+    pub slippage_bps: f64,
+    pub max_levels: usize,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct LatencyConfig {
+    pub simulated_order_delay_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
