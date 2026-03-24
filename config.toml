@@ -1,0 +1,14 @@
+[binance]
+symbols = ["btcusdt", "ethusdt", "solusdt", "xrpusdt"]
+
+[polymarket]
+symbols = ["btc", "eth", "sol", "xrp"]
+
+[strategy]
+threshold = 0.95
+min_size = 5.0
+trade_size = 10.0
+
+[general]
+run_duration_secs = 86400
+log_dir = "./logs"
