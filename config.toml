@@ -31,6 +31,14 @@ exponent = 2
 [latency]
 simulated_order_delay_ms = 10
 
+[logging]
+binance_ticks = false           # ~230MB/hr, disable for 24h runs
+polymarket_snapshots = false    # ~1.5GB/hr, disable for 24h runs
+evaluations = false             # ~420MB/hr, disable for 24h runs
+mock_trades = true              # tiny — only actual trades
+signals = true                  # tiny — only fired signals
+latency_csv = true              # ~23MB/hr, manageable
+
 [general]
 run_duration_secs = 86400
 log_dir = "./logs"

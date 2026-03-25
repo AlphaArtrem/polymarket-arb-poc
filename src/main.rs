@@ -132,43 +132,54 @@ async fn main() {
         strategy::run_settlement(settle_resolution_rx, settle_app_state, settle_cancel).await;
     });
 
-    // Spawn loggers
+    // Spawn loggers (gated by config.logging)
     let log_dir = config.general.log_dir.clone();
+    let log_cfg = &config.logging;
 
-    let log_cancel1 = cancel.clone();
-    let ld1 = log_dir.clone();
-    let tick_log_rx = tick_tx.subscribe();
-    tokio::spawn(async move {
-        logger::log_binance_ticks(ld1, tick_log_rx, log_cancel1).await;
-    });
+    if log_cfg.binance_ticks {
+        let c = cancel.clone();
+        let d = log_dir.clone();
+        let rx = tick_tx.subscribe();
+        tokio::spawn(async move { logger::log_binance_ticks(d, rx, c).await; });
+    } else {
+        info!("Binance tick logging DISABLED");
+    }
 
-    let log_cancel2 = cancel.clone();
-    let ld2 = log_dir.clone();
-    let snap_log_rx = snapshot_tx.subscribe();
-    tokio::spawn(async move {
-        logger::log_polymarket_snapshots(ld2, snap_log_rx, log_cancel2).await;
-    });
+    if log_cfg.polymarket_snapshots {
+        let c = cancel.clone();
+        let d = log_dir.clone();
+        let rx = snapshot_tx.subscribe();
+        tokio::spawn(async move { logger::log_polymarket_snapshots(d, rx, c).await; });
+    } else {
+        info!("Polymarket snapshot logging DISABLED");
+    }
 
-    let log_cancel3 = cancel.clone();
-    let ld3 = log_dir.clone();
-    let trade_log_rx = trade_tx.subscribe();
-    tokio::spawn(async move {
-        logger::log_mock_trades(ld3, trade_log_rx, log_cancel3).await;
-    });
+    if log_cfg.mock_trades {
+        let c = cancel.clone();
+        let d = log_dir.clone();
+        let rx = trade_tx.subscribe();
+        tokio::spawn(async move { logger::log_mock_trades(d, rx, c).await; });
+    }
 
-    let log_cancel4 = cancel.clone();
-    let ld4 = log_dir.clone();
-    let eval_log_rx = eval_tx.subscribe();
-    tokio::spawn(async move {
-        logger::log_evaluations(ld4, eval_log_rx, log_cancel4).await;
-    });
+    if log_cfg.evaluations || log_cfg.latency_csv {
+        let c = cancel.clone();
+        let d = log_dir.clone();
+        let rx = eval_tx.subscribe();
+        let write_evals = log_cfg.evaluations;
+        let write_csv = log_cfg.latency_csv;
+        tokio::spawn(async move {
+            logger::log_evaluations_conditional(d, rx, write_evals, write_csv, c).await;
+        });
+    } else {
+        info!("Evaluation + latency CSV logging DISABLED");
+    }
 
-    let log_cancel5 = cancel.clone();
-    let ld5 = log_dir.clone();
-    let signal_log_rx = signal_tx.subscribe();
-    tokio::spawn(async move {
-        logger::log_signals(ld5, signal_log_rx, log_cancel5).await;
-    });
+    if log_cfg.signals {
+        let c = cancel.clone();
+        let d = log_dir.clone();
+        let rx = signal_tx.subscribe();
+        tokio::spawn(async move { logger::log_signals(d, rx, c).await; });
+    }
 
     info!(
         "All systems running. Will shut down in {} seconds.",

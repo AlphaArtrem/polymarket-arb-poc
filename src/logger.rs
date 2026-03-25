@@ -133,39 +133,49 @@ pub async fn log_signals(
     }
 }
 
-pub async fn log_evaluations(
+pub async fn log_evaluations_conditional(
     log_dir: String,
     mut rx: broadcast::Receiver<Evaluation>,
+    write_evals: bool,
+    write_csv: bool,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     let eval_path = Path::new(&log_dir).join("evaluations.jsonl");
     let csv_path = Path::new(&log_dir).join("latency_metrics.csv");
 
-    // Write CSV header if file doesn't exist
-    if !csv_path.exists() {
+    if write_csv && !csv_path.exists() {
         append_csv_line(
             &csv_path,
             "timestamp,binance_to_decision_us,poly_to_decision_us,decision_duration_us",
         );
     }
 
-    info!("Logging evaluations to {}", eval_path.display());
+    if write_evals {
+        info!("Logging evaluations to {}", eval_path.display());
+    }
+    if write_csv {
+        info!("Logging latency CSV to {}", csv_path.display());
+    }
 
     loop {
         tokio::select! {
             eval = rx.recv() => {
                 match eval {
                     Ok(e) => {
-                        append_jsonl(&eval_path, &e);
-                        let poly_us = e.poly_to_decision_us.map_or("".to_string(), |v| v.to_string());
-                        let csv_line = format!(
-                            "{},{},{},{}",
-                            e.timestamp,
-                            e.binance_to_decision_us,
-                            poly_us,
-                            e.decision_duration_us,
-                        );
-                        append_csv_line(&csv_path, &csv_line);
+                        if write_evals {
+                            append_jsonl(&eval_path, &e);
+                        }
+                        if write_csv {
+                            let poly_us = e.poly_to_decision_us.map_or("".to_string(), |v| v.to_string());
+                            let csv_line = format!(
+                                "{},{},{},{}",
+                                e.timestamp,
+                                e.binance_to_decision_us,
+                                poly_us,
+                                e.decision_duration_us,
+                            );
+                            append_csv_line(&csv_path, &csv_line);
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!("Evaluation logger lagged {} messages", n);

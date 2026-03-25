@@ -9,6 +9,8 @@ pub struct Config {
     pub sniping: SnipingConfig,
     pub fees: FeesConfig,
     pub latency: LatencyConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
     pub general: GeneralConfig,
 }
 
@@ -55,6 +57,38 @@ pub struct FeesConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct LatencyConfig {
     pub simulated_order_delay_ms: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct LoggingConfig {
+    #[serde(default = "default_false")]
+    pub binance_ticks: bool,
+    #[serde(default = "default_false")]
+    pub polymarket_snapshots: bool,
+    #[serde(default = "default_true")]
+    pub evaluations: bool,
+    #[serde(default = "default_true")]
+    pub mock_trades: bool,
+    #[serde(default = "default_true")]
+    pub signals: bool,
+    #[serde(default = "default_true")]
+    pub latency_csv: bool,
+}
+
+fn default_false() -> bool { false }
+fn default_true() -> bool { true }
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            binance_ticks: false,
+            polymarket_snapshots: false,
+            evaluations: true,
+            mock_trades: true,
+            signals: true,
+            latency_csv: true,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
