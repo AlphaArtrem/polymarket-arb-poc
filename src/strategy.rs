@@ -267,7 +267,7 @@ pub async fn run_strategy(
                 }
 
                 // ── Sniping strategy check ──
-                if sniping_cfg.enabled && !trade_triggered {
+                if sniping_cfg.enabled && timing_ok && !trade_triggered {
                     if let Some(spike_val) = spike {
                         if spike_val.abs() > sniping_cfg.spike_threshold_bps {
                             let direction = if spike_val > 0.0 { "Up" } else { "Down" };
@@ -279,7 +279,13 @@ pub async fn run_strategy(
                             };
 
                             if let Some(ask) = target_ask {
-                                if ask < sniping_cfg.max_entry_price && ask < fair_value {
+                                // Check cooldown (shared with directional)
+                                let cd_key = (poly_sym.clone(), direction.to_string());
+                                let cooldown_ok = cooldowns
+                                    .get(&cd_key)
+                                    .map_or(true, |&last| ts_now.saturating_sub(last) > directional_cfg.cooldown_secs * 1000);
+
+                                if ask < sniping_cfg.max_entry_price && ask < fair_value && cooldown_ok {
                                     let ts_decision_end = now_ms();
                                     let elapsed = decision_start.elapsed();
                                     let ts_mock_order = ts_decision_end + latency_cfg.simulated_order_delay_ms;
@@ -353,6 +359,7 @@ pub async fn run_strategy(
                                     drop(st);
 
                                     let _ = trade_tx.send(mock_trade);
+                                    cooldowns.insert(cd_key, ts_now);
                                     trade_triggered = true;
                                     triggered_strategy = Some("sniping".to_string());
                                     triggered_direction = Some(direction.to_string());
