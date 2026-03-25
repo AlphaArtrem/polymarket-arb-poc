@@ -26,6 +26,77 @@ fn estimate_fair_value_up(price_vs_open_bps: f64, sensitivity: f64) -> f64 {
     (0.5 + price_vs_open_bps * sensitivity).clamp(0.05, 0.95)
 }
 
+#[derive(Debug, Default)]
+struct DecisionStats {
+    total_ticks: u64,
+    no_market_data: u64,
+    timing_blocked: u64,
+    directional_threshold_hit: u64,
+    directional_ask_missing: u64,
+    directional_ask_too_high: u64,
+    directional_ask_above_fair: u64,
+    directional_cooldown_blocked: u64,
+    directional_trade: u64,
+    sniping_threshold_hit: u64,
+    sniping_ask_missing: u64,
+    sniping_ask_too_high: u64,
+    sniping_ask_above_fair: u64,
+    sniping_cooldown_blocked: u64,
+    sniping_trade: u64,
+}
+
+#[derive(Debug)]
+struct DecisionStatsSnapshot {
+    window_start_ms: u64,
+    window_end_ms: u64,
+    total_ticks: u64,
+    no_market_data: u64,
+    timing_blocked: u64,
+    directional_threshold_hit: u64,
+    directional_ask_missing: u64,
+    directional_ask_too_high: u64,
+    directional_ask_above_fair: u64,
+    directional_cooldown_blocked: u64,
+    directional_trade: u64,
+    sniping_threshold_hit: u64,
+    sniping_ask_missing: u64,
+    sniping_ask_too_high: u64,
+    sniping_ask_above_fair: u64,
+    sniping_cooldown_blocked: u64,
+    sniping_trade: u64,
+}
+
+impl DecisionStats {
+    fn take_snapshot(&mut self, window_start_ms: u64, window_end_ms: u64) -> Option<DecisionStatsSnapshot> {
+        if self.total_ticks == 0 {
+            return None;
+        }
+
+        let snapshot = DecisionStatsSnapshot {
+            window_start_ms,
+            window_end_ms,
+            total_ticks: self.total_ticks,
+            no_market_data: self.no_market_data,
+            timing_blocked: self.timing_blocked,
+            directional_threshold_hit: self.directional_threshold_hit,
+            directional_ask_missing: self.directional_ask_missing,
+            directional_ask_too_high: self.directional_ask_too_high,
+            directional_ask_above_fair: self.directional_ask_above_fair,
+            directional_cooldown_blocked: self.directional_cooldown_blocked,
+            directional_trade: self.directional_trade,
+            sniping_threshold_hit: self.sniping_threshold_hit,
+            sniping_ask_missing: self.sniping_ask_missing,
+            sniping_ask_too_high: self.sniping_ask_too_high,
+            sniping_ask_above_fair: self.sniping_ask_above_fair,
+            sniping_cooldown_blocked: self.sniping_cooldown_blocked,
+            sniping_trade: self.sniping_trade,
+        };
+
+        *self = Self::default();
+        Some(snapshot)
+    }
+}
+
 pub async fn run_strategy(
     directional_cfg: DirectionalConfig,
     sniping_cfg: SnipingConfig,
@@ -56,6 +127,8 @@ pub async fn run_strategy(
 
     // Track last known window per symbol to detect changes
     let mut known_windows: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut decision_stats = DecisionStats::default();
+    let mut stats_window_start_ms = now_ms();
 
     loop {
         tokio::select! {
@@ -74,6 +147,33 @@ pub async fn run_strategy(
 
                 let decision_start = Instant::now();
                 let ts_decision_start = now_ms();
+                decision_stats.total_ticks += 1;
+
+                if ts_decision_start.saturating_sub(stats_window_start_ms) >= 60_000 {
+                    if let Some(snapshot) = decision_stats.take_snapshot(stats_window_start_ms, ts_decision_start) {
+                        info!(
+                            "DECISION_STATS window=[{},{}] total={} no_market_data={} timing_blocked={} dir_hit={} dir_ask_missing={} dir_ask_too_high={} dir_ask_above_fair={} dir_cooldown={} dir_trade={} snipe_hit={} snipe_ask_missing={} snipe_ask_too_high={} snipe_ask_above_fair={} snipe_cooldown={} snipe_trade={}",
+                            snapshot.window_start_ms,
+                            snapshot.window_end_ms,
+                            snapshot.total_ticks,
+                            snapshot.no_market_data,
+                            snapshot.timing_blocked,
+                            snapshot.directional_threshold_hit,
+                            snapshot.directional_ask_missing,
+                            snapshot.directional_ask_too_high,
+                            snapshot.directional_ask_above_fair,
+                            snapshot.directional_cooldown_blocked,
+                            snapshot.directional_trade,
+                            snapshot.sniping_threshold_hit,
+                            snapshot.sniping_ask_missing,
+                            snapshot.sniping_ask_too_high,
+                            snapshot.sniping_ask_above_fair,
+                            snapshot.sniping_cooldown_blocked,
+                            snapshot.sniping_trade
+                        );
+                    }
+                    stats_window_start_ms = ts_decision_start;
+                }
 
                 // Map binance symbol (e.g. "btcusdt") to polymarket symbol (e.g. "btc")
                 let poly_sym = tick.symbol.replace("usdt", "");
@@ -118,6 +218,7 @@ pub async fn run_strategy(
                 let (snap_ref, condition_id, window_start, window_end) = match (&snapshot, &active) {
                     (Some(s), Some(a)) => (s, a.condition_id.clone(), a.window_start, a.window_end),
                     _ => {
+                        decision_stats.no_market_data += 1;
                         // No market data — emit minimal evaluation
                         let ts_decision_end = now_ms();
                         let elapsed = decision_start.elapsed();
@@ -153,6 +254,9 @@ pub async fn run_strategy(
                 let in_window = time_into.map_or(false, |t| t >= directional_cfg.min_time_into_window_secs);
                 let not_too_late = time_before_close.map_or(false, |t| t >= directional_cfg.max_time_before_close_secs);
                 let timing_ok = in_window && not_too_late;
+                if !timing_ok {
+                    decision_stats.timing_blocked += 1;
+                }
 
                 let pvo_bps = price_vs_open.unwrap_or(0.0);
                 let open_price = tracker.window_open_price(&poly_sym).unwrap_or(0.0);
@@ -167,6 +271,7 @@ pub async fn run_strategy(
 
                 // ── Directional strategy check ──
                 if directional_cfg.enabled && timing_ok && pvo_bps.abs() > directional_cfg.directional_threshold_bps {
+                    decision_stats.directional_threshold_hit += 1;
                     let direction = if pvo_bps > 0.0 { "Up" } else { "Down" };
                     let fair_value_up = estimate_fair_value_up(pvo_bps, dir_sensitivity);
                     let (target_ask, fair_value) = if direction == "Up" {
@@ -176,7 +281,11 @@ pub async fn run_strategy(
                     };
 
                     if let Some(ask) = target_ask {
-                        if ask < directional_cfg.max_entry_price && ask < fair_value {
+                        if ask >= directional_cfg.max_entry_price {
+                            decision_stats.directional_ask_too_high += 1;
+                        } else if ask >= fair_value {
+                            decision_stats.directional_ask_above_fair += 1;
+                        } else {
                             // Check cooldown
                             let cd_key = (poly_sym.clone(), direction.to_string());
                             let cooldown_ok = cooldowns
@@ -258,11 +367,16 @@ pub async fn run_strategy(
 
                                 let _ = trade_tx.send(mock_trade);
                                 cooldowns.insert(cd_key, ts_now);
+                                decision_stats.directional_trade += 1;
                                 trade_triggered = true;
                                 triggered_strategy = Some("directional".to_string());
                                 triggered_direction = Some(direction.to_string());
+                            } else {
+                                decision_stats.directional_cooldown_blocked += 1;
                             }
                         }
+                    } else {
+                        decision_stats.directional_ask_missing += 1;
                     }
                 }
 
@@ -270,6 +384,7 @@ pub async fn run_strategy(
                 if sniping_cfg.enabled && timing_ok && !trade_triggered {
                     if let Some(spike_val) = spike {
                         if spike_val.abs() > sniping_cfg.spike_threshold_bps {
+                            decision_stats.sniping_threshold_hit += 1;
                             let direction = if spike_val > 0.0 { "Up" } else { "Down" };
                             let fair_value_up = estimate_fair_value_up(pvo_bps, snipe_sensitivity);
                             let (target_ask, fair_value) = if direction == "Up" {
@@ -285,7 +400,13 @@ pub async fn run_strategy(
                                     .get(&cd_key)
                                     .map_or(true, |&last| ts_now.saturating_sub(last) > directional_cfg.cooldown_secs * 1000);
 
-                                if ask < sniping_cfg.max_entry_price && ask < fair_value && cooldown_ok {
+                                if ask >= sniping_cfg.max_entry_price {
+                                    decision_stats.sniping_ask_too_high += 1;
+                                } else if ask >= fair_value {
+                                    decision_stats.sniping_ask_above_fair += 1;
+                                } else if !cooldown_ok {
+                                    decision_stats.sniping_cooldown_blocked += 1;
+                                } else {
                                     let ts_decision_end = now_ms();
                                     let elapsed = decision_start.elapsed();
                                     let ts_mock_order = ts_decision_end + latency_cfg.simulated_order_delay_ms;
@@ -360,10 +481,13 @@ pub async fn run_strategy(
 
                                     let _ = trade_tx.send(mock_trade);
                                     cooldowns.insert(cd_key, ts_now);
+                                    decision_stats.sniping_trade += 1;
                                     trade_triggered = true;
                                     triggered_strategy = Some("sniping".to_string());
                                     triggered_direction = Some(direction.to_string());
                                 }
+                            } else {
+                                decision_stats.sniping_ask_missing += 1;
                             }
                         }
                     }
@@ -475,5 +599,42 @@ pub async fn run_settlement(
             }
             _ = cancel.cancelled() => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decision_stats_snapshot_resets_counts() {
+        let mut stats = DecisionStats::default();
+        stats.total_ticks = 10;
+        stats.no_market_data = 2;
+        stats.timing_blocked = 3;
+        stats.directional_threshold_hit = 4;
+        stats.directional_trade = 1;
+        stats.sniping_threshold_hit = 2;
+        stats.sniping_ask_above_fair = 2;
+
+        let snapshot = stats.take_snapshot(1_000, 61_000).expect("snapshot");
+        assert_eq!(snapshot.window_start_ms, 1_000);
+        assert_eq!(snapshot.window_end_ms, 61_000);
+        assert_eq!(snapshot.total_ticks, 10);
+        assert_eq!(snapshot.no_market_data, 2);
+        assert_eq!(snapshot.timing_blocked, 3);
+        assert_eq!(snapshot.directional_threshold_hit, 4);
+        assert_eq!(snapshot.directional_trade, 1);
+        assert_eq!(snapshot.sniping_threshold_hit, 2);
+        assert_eq!(snapshot.sniping_ask_above_fair, 2);
+
+        assert!(stats.take_snapshot(61_000, 121_000).is_none());
+        assert_eq!(stats.total_ticks, 0);
+        assert_eq!(stats.no_market_data, 0);
+        assert_eq!(stats.timing_blocked, 0);
+        assert_eq!(stats.directional_threshold_hit, 0);
+        assert_eq!(stats.directional_trade, 0);
+        assert_eq!(stats.sniping_threshold_hit, 0);
+        assert_eq!(stats.sniping_ask_above_fair, 0);
     }
 }
