@@ -1,0 +1,5 @@
+symbol,evaluations,trade_triggered,edge_positive,binance_to_decision_us_mean,binance_to_decision_us_p95,poly_to_decision_us_mean,poly_to_decision_us_p95,decision_duration_us_mean,decision_duration_us_p95,combined_ask_min,combined_ask_p05,combined_ask_p50
+btc,31697,0,0,0.915,0,133937.029,889000,0.882,4,1.01,1.01,1.01
+eth,22737,0,0,1.407,0,375804.812,2184000,1.161,4,1.01,1.01,1.01
+sol,10268,0,0,0.292,0,481127.678,2096000,1.000,4,1.00,1.01,1.01
+xrp,5871,0,0,0.511,0,428271.334,2290000,0.957,4,1.01,1.01,1.01
