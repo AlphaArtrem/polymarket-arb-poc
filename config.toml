@@ -6,22 +6,22 @@ symbols = ["btc", "eth", "sol", "xrp"]
 
 [directional]
 enabled = true
-directional_threshold_bps = 30.0
-max_entry_price = 0.85
+directional_threshold_bps = 25.0
+max_entry_price = 0.92
 momentum_window_secs = 30
 min_time_into_window_secs = 60
 max_time_before_close_secs = 120
 cooldown_secs = 30
-fair_value_sensitivity = 0.005
+fair_value_sensitivity = 0.008
 trade_size = 10.0
 
 [sniping]
 enabled = true
-spike_threshold_bps = 20.0
+spike_threshold_bps = 15.0
 spike_window_secs = 5
-max_entry_price = 0.85
+max_entry_price = 0.92
 staleness_max_ms = 2000
-fair_value_sensitivity = 0.005
+fair_value_sensitivity = 0.008
 trade_size = 10.0
 
 [fees]
