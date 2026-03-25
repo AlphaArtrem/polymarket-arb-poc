@@ -1,4 +1,4 @@
-use crate::types::{Evaluation, MarketSnapshot, MockTrade, UnderlyingTick};
+use crate::types::{DirectionalSignal, Evaluation, MarketSnapshot, MockTrade, UnderlyingTick};
 use std::io::Write;
 use std::path::Path;
 use tokio::sync::broadcast;
@@ -109,6 +109,30 @@ pub async fn log_mock_trades(
     }
 }
 
+pub async fn log_signals(
+    log_dir: String,
+    mut rx: broadcast::Receiver<DirectionalSignal>,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    let path = Path::new(&log_dir).join("signals.jsonl");
+    info!("Logging signals to {}", path.display());
+
+    loop {
+        tokio::select! {
+            sig = rx.recv() => {
+                match sig {
+                    Ok(s) => append_jsonl(&path, &s),
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("Signal logger lagged {} messages", n);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+            _ = cancel.cancelled() => return,
+        }
+    }
+}
+
 pub async fn log_evaluations(
     log_dir: String,
     mut rx: broadcast::Receiver<Evaluation>,
@@ -121,7 +145,7 @@ pub async fn log_evaluations(
     if !csv_path.exists() {
         append_csv_line(
             &csv_path,
-            "timestamp,binance_to_decision_us,poly_to_decision_us,decision_duration_us,simulated_order_delay_ms",
+            "timestamp,binance_to_decision_us,poly_to_decision_us,decision_duration_us",
         );
     }
 
@@ -135,12 +159,11 @@ pub async fn log_evaluations(
                         append_jsonl(&eval_path, &e);
                         let poly_us = e.poly_to_decision_us.map_or("".to_string(), |v| v.to_string());
                         let csv_line = format!(
-                            "{},{},{},{},{}",
+                            "{},{},{},{}",
                             e.timestamp,
                             e.binance_to_decision_us,
                             poly_us,
                             e.decision_duration_us,
-                            e.simulated_order_delay_ms
                         );
                         append_csv_line(&csv_path, &csv_line);
                     }

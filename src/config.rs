@@ -5,8 +5,9 @@ use std::path::Path;
 pub struct Config {
     pub binance: BinanceConfig,
     pub polymarket: PolymarketConfig,
-    pub strategy: StrategyConfig,
-    pub execution: ExecutionConfig,
+    pub directional: DirectionalConfig,
+    pub sniping: SnipingConfig,
+    pub fees: FeesConfig,
     pub latency: LatencyConfig,
     pub general: GeneralConfig,
 }
@@ -22,17 +23,33 @@ pub struct PolymarketConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct StrategyConfig {
-    pub threshold: f64,
-    pub min_size: f64,
+pub struct DirectionalConfig {
+    pub enabled: bool,
+    pub directional_threshold_bps: f64,
+    pub max_entry_price: f64,
+    pub momentum_window_secs: u64,
+    pub min_time_into_window_secs: u64,
+    pub max_time_before_close_secs: u64,
+    pub cooldown_secs: u64,
+    pub fair_value_sensitivity: f64,
     pub trade_size: f64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct ExecutionConfig {
-    pub taker_fee_bps: f64,
-    pub slippage_bps: f64,
-    pub max_levels: usize,
+pub struct SnipingConfig {
+    pub enabled: bool,
+    pub spike_threshold_bps: f64,
+    pub spike_window_secs: u64,
+    pub max_entry_price: f64,
+    pub staleness_max_ms: u64,
+    pub fair_value_sensitivity: f64,
+    pub trade_size: f64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct FeesConfig {
+    pub rate: f64,
+    pub exponent: u32,
 }
 
 #[derive(Debug, Deserialize, Clone)]
