@@ -10,12 +10,21 @@ Use this runbook only for live `paper` sessions where VPS network location can m
 
 ## Prerequisites
 
-- Local repo is clean and ready to deploy at `/Users/alphaartrem/Desktop/workspace/polymarket-arb-poc`.
-- SSH key exists locally at `/Users/alphaartrem/ec2_poly.pem`.
+Edit these once and reuse them in the commands below:
+
+```bash
+VPS_USER="ec2-user"
+VPS_HOST="<host>"
+KEY="~/ec2_poly.pem"
+HOST="${VPS_USER}@${VPS_HOST}"
+```
+
+- Local repo is clean and you are running commands from the repo root.
+- SSH key exists locally at `KEY` (default `~/ec2_poly.pem`).
 - Target host is reachable:
 
 ```bash
-ssh -i ~/ec2_poly.pem ec2-user@<host>
+ssh -i "$KEY" "$HOST"
 ```
 
 - Target instance is Amazon Linux 2023 on `aarch64` (eu-west-1, Dublin).
@@ -29,7 +38,6 @@ Use this when you have a working Linux ARM release binary locally.
 ### 1. Build the binary locally
 
 ```bash
-cd /Users/alphaartrem/Desktop/workspace/polymarket-arb-poc
 cargo build --release --target aarch64-unknown-linux-gnu
 ```
 
@@ -38,40 +46,40 @@ If local cross-compilation does not work (OpenSSL / native-tls linker issues on 
 ### 2. Upload only the runtime payload
 
 ```bash
-rsync -az -e 'ssh -i /Users/alphaartrem/ec2_poly.pem' \
+rsync -az -e "ssh -i $KEY" \
   target/aarch64-unknown-linux-gnu/release/polymarket-arb-poc \
   config.toml \
-  ec2-user@<host>:/home/ec2-user/arb-upload/
+  $HOST:~/arb-upload/
 ```
 
 ### 3. Prepare the VPS
 
 ```bash
-ssh -i /Users/alphaartrem/ec2_poly.pem ec2-user@<host> 'bash -s' <<'EOF'
+ssh -i "$KEY" "$HOST" 'bash -s' <<'EOF'
 set -euo pipefail
-mkdir -p /home/ec2-user/arb/logs
-cp /home/ec2-user/arb-upload/polymarket-arb-poc /home/ec2-user/arb/polymarket-arb-poc
-chmod +x /home/ec2-user/arb/polymarket-arb-poc
-cp /home/ec2-user/arb-upload/config.toml /home/ec2-user/arb/config.toml
+mkdir -p "$HOME/arb/logs"
+cp "$HOME/arb-upload/polymarket-arb-poc" "$HOME/arb/polymarket-arb-poc"
+chmod +x "$HOME/arb/polymarket-arb-poc"
+cp "$HOME/arb-upload/config.toml" "$HOME/arb/config.toml"
 EOF
 ```
 
 ### 4. Verify NTP sync
 
 ```bash
-ssh -i /Users/alphaartrem/ec2_poly.pem ec2-user@<host> 'chronyc sources'
+ssh -i "$KEY" "$HOST" 'chronyc sources'
 # Expect: ^* 169.254.169.123 ... (sub-ms sync)
 ```
 
 ### 5. Run the pre-flight latency check
 
 ```bash
-ssh -i /Users/alphaartrem/ec2_poly.pem ec2-user@<host> 'bash -s' <<'EOF'
+ssh -i "$KEY" "$HOST" 'bash -s' <<'EOF'
 set -euo pipefail
-echo "=== Pre-flight latency ===" > /home/ec2-user/arb/pre_flight.txt
-ping -c 10 stream.binance.com >> /home/ec2-user/arb/pre_flight.txt 2>&1
-ping -c 10 ws-subscriptions-clob.polymarket.com >> /home/ec2-user/arb/pre_flight.txt 2>&1
-cat /home/ec2-user/arb/pre_flight.txt
+echo "=== Pre-flight latency ===" > "$HOME/arb/pre_flight.txt"
+ping -c 10 stream.binance.com >> "$HOME/arb/pre_flight.txt" 2>&1
+ping -c 10 ws-subscriptions-clob.polymarket.com >> "$HOME/arb/pre_flight.txt" 2>&1
+cat "$HOME/arb/pre_flight.txt"
 EOF
 ```
 
@@ -80,9 +88,9 @@ EOF
 Replace `<session-id>` with a descriptive tag like `dir-v1-20260325T160000Z` and `<bounded-seconds>` with the run duration (e.g., `86400` for 24 hours, `3600` for 1 hour).
 
 ```bash
-ssh -i /Users/alphaartrem/ec2_poly.pem ec2-user@<host> 'bash -s' <<'EOF'
+ssh -i "$KEY" "$HOST" 'bash -s' <<'EOF'
 set -euo pipefail
-cd /home/ec2-user/arb
+cd "$HOME/arb"
 mkdir -p logs
 
 # Start the session in the background
@@ -106,13 +114,13 @@ EOF
 
 ```bash
 # Watch trades in real-time
-ssh -i /Users/alphaartrem/ec2_poly.pem ec2-user@<host> 'tail -f /home/ec2-user/arb/logs/mock_trades.jsonl'
+ssh -i "$KEY" "$HOST" 'tail -f $HOME/arb/logs/mock_trades.jsonl'
 
 # Count trades so far
-ssh -i /Users/alphaartrem/ec2_poly.pem ec2-user@<host> 'wc -l /home/ec2-user/arb/logs/mock_trades.jsonl /home/ec2-user/arb/logs/signals.jsonl 2>/dev/null'
+ssh -i "$KEY" "$HOST" 'wc -l $HOME/arb/logs/mock_trades.jsonl $HOME/arb/logs/signals.jsonl 2>/dev/null'
 
 # Check if process is still alive
-ssh -i /Users/alphaartrem/ec2_poly.pem ec2-user@<host> 'ps -p $(cat /home/ec2-user/arb/pid.txt) && echo RUNNING || echo STOPPED'
+ssh -i "$KEY" "$HOST" 'ps -p $(cat $HOME/arb/pid.txt) && echo RUNNING || echo STOPPED'
 ```
 
 ### 8. Copy artifacts back locally
@@ -121,14 +129,14 @@ ssh -i /Users/alphaartrem/ec2_poly.pem ec2-user@<host> 'ps -p $(cat /home/ec2-us
 SESSION_ID="<session-id>"
 mkdir -p artifacts/paper/${SESSION_ID}
 
-rsync -az -e 'ssh -i /Users/alphaartrem/ec2_poly.pem -o BatchMode=yes' \
-  ec2-user@<host>:/home/ec2-user/arb/logs/ \
+rsync -az -e "ssh -i $KEY -o BatchMode=yes" \
+  $HOST:~/arb/logs/ \
   artifacts/paper/${SESSION_ID}/logs/
 
-rsync -az -e 'ssh -i /Users/alphaartrem/ec2_poly.pem -o BatchMode=yes' \
-  ec2-user@<host>:/home/ec2-user/arb/run.log \
-  ec2-user@<host>:/home/ec2-user/arb/pre_flight.txt \
-  ec2-user@<host>:/home/ec2-user/arb/config.toml \
+rsync -az -e "ssh -i $KEY -o BatchMode=yes" \
+  $HOST:~/arb/run.log \
+  $HOST:~/arb/pre_flight.txt \
+  $HOST:~/arb/config.toml \
   artifacts/paper/${SESSION_ID}/
 ```
 
@@ -164,15 +172,13 @@ Use this when local cross-compilation to `aarch64-unknown-linux-gnu` is blocked 
 ### 1. Sync the repo to the VPS
 
 ```bash
-cd /Users/alphaartrem/Desktop/workspace/polymarket-arb-poc
-
 rsync -az --delete \
   --exclude '.git' \
   --exclude 'target' \
   --exclude 'artifacts' \
   --exclude '*.DS_Store' \
-  -e 'ssh -i /Users/alphaartrem/ec2_poly.pem -o BatchMode=yes' \
-  ./ ec2-user@<host>:/home/ec2-user/arb-src/
+  -e "ssh -i $KEY -o BatchMode=yes" \
+  ./ $HOST:~/arb-src/
 ```
 
 ### 2. Install build prerequisites and Rust on the VPS
@@ -180,7 +186,7 @@ rsync -az --delete \
 Do not install `curl` with `dnf` on Amazon Linux 2023 — the instance has `curl-minimal` and full `curl` causes package conflicts.
 
 ```bash
-ssh -i /Users/alphaartrem/ec2_poly.pem ec2-user@<host> 'bash -s' <<'EOF'
+ssh -i "$KEY" "$HOST" 'bash -s' <<'EOF'
 set -euo pipefail
 sudo dnf install -y gcc gcc-c++ make perl-core openssl-devel pkgconf-pkg-config
 if test ! -x "$HOME/.cargo/bin/cargo"; then
@@ -192,20 +198,20 @@ EOF
 ### 3. Build the release binary on the VPS
 
 ```bash
-ssh -i /Users/alphaartrem/ec2_poly.pem ec2-user@<host> 'bash -s' <<'EOF'
+ssh -i "$KEY" "$HOST" 'bash -s' <<'EOF'
 set -euo pipefail
 source "$HOME/.cargo/env"
-cd /home/ec2-user/arb-src
+cd "$HOME/arb-src"
 cargo build --release
-mkdir -p /home/ec2-user/arb/logs
-cp target/release/polymarket-arb-poc /home/ec2-user/arb/polymarket-arb-poc
-cp config.toml /home/ec2-user/arb/config.toml
+mkdir -p "$HOME/arb/logs"
+cp target/release/polymarket-arb-poc "$HOME/arb/polymarket-arb-poc"
+cp config.toml "$HOME/arb/config.toml"
 EOF
 ```
 
 ### 4. Verify NTP, run pre-flight, start session
 
-Follow steps 4 through 9 from the preferred path above. All VPS paths reference `/home/ec2-user/arb/` the same way.
+Follow steps 4 through 9 from the preferred path above. All VPS paths reference `$HOME/arb/` the same way.
 
 ---
 
@@ -215,14 +221,16 @@ If you just want to run the full flow end-to-end with minimal interaction:
 
 ```bash
 # Variables — set these once
-HOST="ec2-user@<host>"
-KEY="/Users/alphaartrem/ec2_poly.pem"
+VPS_USER="ec2-user"
+VPS_HOST="<host>"
+HOST="${VPS_USER}@${VPS_HOST}"
+KEY="~/ec2_poly.pem"
 SESSION="dir-v1-$(date -u +%Y%m%dT%H%M%SZ)"
-REPO="/Users/alphaartrem/Desktop/workspace/polymarket-arb-poc"
+REPO="$(pwd)"
 
 # 1. Sync source (fallback path)
 rsync -az --delete --exclude '.git' --exclude 'target' --exclude 'artifacts' --exclude '*.DS_Store' \
-  -e "ssh -i $KEY -o BatchMode=yes" $REPO/ $HOST:/home/ec2-user/arb-src/
+  -e "ssh -i $KEY -o BatchMode=yes" $REPO/ $HOST:~/arb-src/
 
 # 2. Build on VPS (skip if you already have the binary there)
 ssh -i $KEY $HOST 'bash -s' <<'BUILDEOF'
@@ -230,17 +238,17 @@ set -euo pipefail
 sudo dnf install -y gcc gcc-c++ make perl-core openssl-devel pkgconf-pkg-config 2>/dev/null || true
 test -x "$HOME/.cargo/bin/cargo" || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 source "$HOME/.cargo/env"
-cd /home/ec2-user/arb-src
+cd "$HOME/arb-src"
 cargo build --release
-mkdir -p /home/ec2-user/arb/logs
-cp target/release/polymarket-arb-poc /home/ec2-user/arb/polymarket-arb-poc
-cp config.toml /home/ec2-user/arb/config.toml
+mkdir -p "$HOME/arb/logs"
+cp target/release/polymarket-arb-poc "$HOME/arb/polymarket-arb-poc"
+cp config.toml "$HOME/arb/config.toml"
 BUILDEOF
 
 # 3. Run pre-flight + start session
 ssh -i $KEY $HOST 'bash -s' <<'RUNEOF'
 set -euo pipefail
-cd /home/ec2-user/arb
+cd "$HOME/arb"
 echo "=== Pre-flight ===" > pre_flight.txt
 ping -c 10 stream.binance.com >> pre_flight.txt 2>&1
 ping -c 10 ws-subscriptions-clob.polymarket.com >> pre_flight.txt 2>&1
@@ -256,9 +264,9 @@ echo "Session $SESSION running. Collect artifacts after completion."
 # 4. After the run — collect artifacts
 mkdir -p artifacts/paper/$SESSION
 rsync -az -e "ssh -i $KEY -o BatchMode=yes" \
-  $HOST:/home/ec2-user/arb/logs/ artifacts/paper/$SESSION/logs/
+  $HOST:~/arb/logs/ artifacts/paper/$SESSION/logs/
 rsync -az -e "ssh -i $KEY -o BatchMode=yes" \
-  $HOST:/home/ec2-user/arb/run.log $HOST:/home/ec2-user/arb/pre_flight.txt $HOST:/home/ec2-user/arb/config.toml \
+  $HOST:~/arb/run.log $HOST:~/arb/pre_flight.txt $HOST:~/arb/config.toml \
   artifacts/paper/$SESSION/
 
 # 5. Verify
@@ -275,20 +283,20 @@ When code changes are pushed to master:
 ```bash
 # Sync updated source
 rsync -az --delete --exclude '.git' --exclude 'target' --exclude 'artifacts' --exclude '*.DS_Store' \
-  -e "ssh -i $KEY -o BatchMode=yes" $REPO/ $HOST:/home/ec2-user/arb-src/
+  -e "ssh -i $KEY -o BatchMode=yes" $REPO/ $HOST:~/arb-src/
 
 # Rebuild on VPS
 ssh -i $KEY $HOST 'bash -s' <<'EOF'
 set -euo pipefail
 source "$HOME/.cargo/env"
-cd /home/ec2-user/arb-src
+cd "$HOME/arb-src"
 cargo build --release
 # Kill old process
-kill $(cat /home/ec2-user/arb/pid.txt) 2>/dev/null || true
+kill $(cat "$HOME/arb/pid.txt") 2>/dev/null || true
 sleep 2
-cp target/release/polymarket-arb-poc /home/ec2-user/arb/polymarket-arb-poc
-cp config.toml /home/ec2-user/arb/config.toml
-cd /home/ec2-user/arb
+cp target/release/polymarket-arb-poc "$HOME/arb/polymarket-arb-poc"
+cp config.toml "$HOME/arb/config.toml"
+cd "$HOME/arb"
 rm -rf logs/*
 RUST_LOG=info nohup ./polymarket-arb-poc > run.log 2>&1 &
 echo $! > pid.txt
@@ -303,13 +311,13 @@ EOF
 
 ### Binary fails to start
 ```bash
-ssh -i $KEY $HOST 'file /home/ec2-user/arb/polymarket-arb-poc'
+ssh -i $KEY $HOST 'file $HOME/arb/polymarket-arb-poc'
 # Should show: ELF 64-bit ... ARM aarch64
-ssh -i $KEY $HOST 'tail -30 /home/ec2-user/arb/run.log'
+ssh -i $KEY $HOST 'tail -30 $HOME/arb/run.log'
 ```
 
 ### "config.toml not found"
-The binary looks for `config.toml` in the current working directory. The run commands `cd /home/ec2-user/arb` before launching.
+The binary looks for `config.toml` in the current working directory. The run commands should `cd $HOME/arb` before launching.
 
 ### No Polymarket data
 Markets rotate every 15 min. The discovery task needs ~2 min to fetch the first market. Check `run.log` for "Fetching Gamma API" and "Discovered N markets" messages.
