@@ -4,15 +4,29 @@ symbols = ["btcusdt", "ethusdt", "solusdt", "xrpusdt"]
 [polymarket]
 symbols = ["btc", "eth", "sol", "xrp"]
 
-[strategy]
-threshold = 0.95
-min_size = 5.0
+[directional]
+enabled = true
+directional_threshold_bps = 30.0
+max_entry_price = 0.85
+momentum_window_secs = 30
+min_time_into_window_secs = 60
+max_time_before_close_secs = 120
+cooldown_secs = 30
+fair_value_sensitivity = 0.005
 trade_size = 10.0
 
-[execution]
-taker_fee_bps = 30
-slippage_bps = 10
-max_levels = 3
+[sniping]
+enabled = true
+spike_threshold_bps = 20.0
+spike_window_secs = 5
+max_entry_price = 0.85
+staleness_max_ms = 2000
+fair_value_sensitivity = 0.005
+trade_size = 10.0
+
+[fees]
+rate = 0.25
+exponent = 2
 
 [latency]
 simulated_order_delay_ms = 10

@@ -1,7 +1,9 @@
+use crate::config::{DirectionalConfig, FeesConfig, LatencyConfig, SnipingConfig};
 use crate::polymarket_feed::PolymarketState;
+use crate::signals::PriceTracker;
 use crate::state::SharedState;
-use crate::types::{Evaluation, MarketSnapshot, MockTrade, UnderlyingTick};
-use std::collections::{HashMap, VecDeque};
+use crate::types::{DirectionalSignal, Evaluation, MockTrade, UnderlyingTick};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, RwLock};
@@ -14,53 +16,49 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Rolling buffer of recent snapshots per symbol, used to find the snapshot
-/// closest to ts_mock_order (= ts_decision_end + simulated_order_delay_ms).
-const MAX_SNAPSHOT_HISTORY: usize = 500;
+/// Polymarket fee per share: rate * (price * (1 - price))^exponent
+fn polymarket_fee(price: f64, rate: f64, exponent: u32) -> f64 {
+    rate * (price * (1.0 - price)).powi(exponent as i32)
+}
+
+/// Linear fair value estimate: 0.5 + price_vs_open_bps * sensitivity, clamped to [0.05, 0.95].
+fn estimate_fair_value_up(price_vs_open_bps: f64, sensitivity: f64) -> f64 {
+    (0.5 + price_vs_open_bps * sensitivity).clamp(0.05, 0.95)
+}
 
 pub async fn run_strategy(
-    threshold: f64,
-    trade_size: f64,
-    taker_fee_bps: f64,
-    slippage_bps: f64,
-    simulated_order_delay_ms: u64,
+    directional_cfg: DirectionalConfig,
+    sniping_cfg: SnipingConfig,
+    fees_cfg: FeesConfig,
+    latency_cfg: LatencyConfig,
     mut tick_rx: broadcast::Receiver<UnderlyingTick>,
-    mut snapshot_rx: broadcast::Receiver<MarketSnapshot>,
     poly_state: Arc<RwLock<PolymarketState>>,
     app_state: SharedState,
     eval_tx: broadcast::Sender<Evaluation>,
     trade_tx: broadcast::Sender<MockTrade>,
+    signal_tx: broadcast::Sender<DirectionalSignal>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     info!(
-        "Strategy engine started (threshold={}, taker_fee_bps={}, slippage_bps={}, simulated_order_delay_ms={})",
-        threshold, taker_fee_bps, slippage_bps, simulated_order_delay_ms
+        "Strategy engine started (directional={}, sniping={}, fee_rate={}, fee_exp={}, delay={}ms)",
+        directional_cfg.enabled,
+        sniping_cfg.enabled,
+        fees_cfg.rate,
+        fees_cfg.exponent,
+        latency_cfg.simulated_order_delay_ms,
     );
 
-    // Rolling buffer: symbol -> VecDeque<(ts_receive, MarketSnapshot)>
-    let mut snapshot_history: HashMap<String, VecDeque<(u64, MarketSnapshot)>> = HashMap::new();
+    let max_buffer = directional_cfg.momentum_window_secs.max(60);
+    let mut tracker = PriceTracker::new(max_buffer);
+
+    // Cooldown: (symbol, direction) -> last_trade_ts_ms
+    let mut cooldowns: HashMap<(String, String), u64> = HashMap::new();
+
+    // Track last known window per symbol to detect changes
+    let mut known_windows: HashMap<String, (u64, u64)> = HashMap::new();
 
     loop {
         tokio::select! {
-            // Populate snapshot buffer from broadcast
-            snap = snapshot_rx.recv() => {
-                match snap {
-                    Ok(s) => {
-                        let deque = snapshot_history
-                            .entry(s.symbol.clone())
-                            .or_insert_with(VecDeque::new);
-                        let ts = s.ts_last_update;
-                        deque.push_back((ts, s));
-                        if deque.len() > MAX_SNAPSHOT_HISTORY {
-                            deque.pop_front();
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("Snapshot buffer lagged {} messages", n);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return,
-                }
-            }
             tick = tick_rx.recv() => {
                 let tick = match tick {
                     Ok(t) => t,
@@ -79,217 +77,318 @@ pub async fn run_strategy(
 
                 // Map binance symbol (e.g. "btcusdt") to polymarket symbol (e.g. "btc")
                 let poly_sym = tick.symbol.replace("usdt", "");
+                let ts_now = tick.ts_receive;
 
-                // Look up the current market snapshot for initial check
-                let ps = poly_state.read().await;
-                let active = ps.active_markets.get(&poly_sym);
-                let snapshot = active.and_then(|a| ps.snapshots.get(&a.condition_id));
-
-                let (up_ask, down_ask, ts_poly, window_start, window_end, condition_id) =
-                    match snapshot {
-                        Some(snap) => (
-                            snap.up_best_ask,
-                            snap.down_best_ask,
-                            Some(snap.ts_last_update),
-                            snap.window_start,
-                            snap.window_end,
-                            snap.condition_id.clone(),
-                        ),
-                        None => {
-                            let ts_decision_end = now_ms();
-                            let elapsed = decision_start.elapsed();
-                            let eval = Evaluation {
-                                timestamp: ts_decision_start,
-                                symbol: poly_sym.clone(),
-                                binance_mid: tick.mid_price,
-                                up_best_ask: None,
-                                down_best_ask: None,
-                                combined_ask: None,
-                                combined_exec: None,
-                                expected_profit_gross: None,
-                                expected_profit_net: None,
-                                edge_positive: false,
-                                up_depth_available: None,
-                                down_depth_available: None,
-                                simulated_order_delay_ms,
-                                trade_triggered: false,
-                                ts_binance_receive: tick.ts_receive,
-                                ts_poly_last_update: None,
-                                ts_decision_start,
-                                ts_decision_end,
-                                binance_to_decision_us: (ts_decision_start - tick.ts_receive) * 1000,
-                                poly_to_decision_us: None,
-                                decision_duration_us: elapsed.as_micros() as u64,
-                            };
-                            let _ = eval_tx.send(eval);
-                            continue;
+                // Update PriceTracker window from poly_state if changed
+                {
+                    let ps = poly_state.read().await;
+                    if let Some(active) = ps.active_markets.get(&poly_sym) {
+                        let current_window = (active.window_start, active.window_end);
+                        let changed = known_windows
+                            .get(&poly_sym)
+                            .map_or(true, |w| *w != current_window);
+                        if changed {
+                            tracker.set_window(&poly_sym, active.window_start, active.window_end);
+                            known_windows.insert(poly_sym.clone(), current_window);
                         }
-                    };
+                    }
+                }
+
+                // Update tracker with new tick
+                tracker.on_tick(&poly_sym, tick.mid_price, ts_now);
+
+                // Compute signals
+                let price_vs_open = tracker.price_vs_open_bps(&poly_sym, tick.mid_price);
+                let momentum_short = tracker.momentum_bps(&poly_sym, tick.mid_price, 5, ts_now);
+                let momentum_medium = tracker.momentum_bps(&poly_sym, tick.mid_price, 15, ts_now);
+                let spike = tracker.spike_bps(&poly_sym, tick.mid_price, sniping_cfg.spike_window_secs, ts_now);
+                let trend = tracker.trend_strength(&poly_sym);
+                let time_into = tracker.time_into_window_secs(&poly_sym, ts_now);
+                let time_before_close = tracker.time_before_close_secs(&poly_sym, ts_now);
+
+                // Read Polymarket snapshot
+                let ps = poly_state.read().await;
+                let active = ps.active_markets.get(&poly_sym).cloned();
+                let snapshot = active
+                    .as_ref()
+                    .and_then(|a| ps.snapshots.get(&a.condition_id))
+                    .cloned();
                 drop(ps);
 
-                let combined = match (up_ask, down_ask) {
-                    (Some(u), Some(d)) => Some(u + d),
-                    _ => None,
+                let (snap_ref, condition_id, window_start, window_end) = match (&snapshot, &active) {
+                    (Some(s), Some(a)) => (s, a.condition_id.clone(), a.window_start, a.window_end),
+                    _ => {
+                        // No market data — emit minimal evaluation
+                        let ts_decision_end = now_ms();
+                        let elapsed = decision_start.elapsed();
+                        let eval = Evaluation {
+                            timestamp: ts_decision_start,
+                            symbol: poly_sym.clone(),
+                            binance_mid: tick.mid_price,
+                            up_best_ask: None,
+                            down_best_ask: None,
+                            combined_ask: None,
+                            price_vs_open_bps: price_vs_open,
+                            spike_bps: spike,
+                            direction: None,
+                            strategy: None,
+                            trade_triggered: false,
+                            ts_binance_receive: tick.ts_receive,
+                            ts_poly_last_update: None,
+                            ts_decision_start,
+                            ts_decision_end,
+                            binance_to_decision_us: ts_decision_start.saturating_sub(tick.ts_receive) * 1000,
+                            poly_to_decision_us: None,
+                            decision_duration_us: elapsed.as_micros() as u64,
+                        };
+                        let _ = eval_tx.send(eval);
+                        continue;
+                    }
                 };
 
-                let trade_triggered = combined.map_or(false, |c| c <= threshold);
+                let ts_poly = snap_ref.ts_last_update;
+                let quote_age_ms = ts_now.saturating_sub(ts_poly);
 
-                let ts_decision_end = now_ms();
-                let elapsed = decision_start.elapsed();
+                // Check timing constraints
+                let in_window = time_into.map_or(false, |t| t >= directional_cfg.min_time_into_window_secs);
+                let not_too_late = time_before_close.map_or(false, |t| t >= directional_cfg.max_time_before_close_secs);
+                let timing_ok = in_window && not_too_late;
 
-                if trade_triggered {
-                    let up_ask_price = up_ask.unwrap();
-                    let down_ask_price = down_ask.unwrap();
-                    let combined_ask = combined.unwrap();
+                let pvo_bps = price_vs_open.unwrap_or(0.0);
+                let open_price = tracker.window_open_price(&poly_sym).unwrap_or(0.0);
 
-                    // Compute ts_mock_order and find the snapshot at that time
-                    let ts_mock_order = ts_decision_end + simulated_order_delay_ms;
+                // Sensitivity for fair value
+                let dir_sensitivity = directional_cfg.fair_value_sensitivity;
+                let snipe_sensitivity = sniping_cfg.fair_value_sensitivity;
 
-                    // Find the latest snapshot with ts <= ts_mock_order from the buffer.
-                    // If no buffered snapshot, fall back to latest known from poly_state.
-                    let exec_snapshot: Option<MarketSnapshot> = snapshot_history
-                        .get(&poly_sym)
-                        .and_then(|deque| {
-                            deque.iter().rev().find(|(ts, _)| *ts <= ts_mock_order).map(|(_, s)| s.clone())
-                        });
+                let mut trade_triggered = false;
+                let mut triggered_strategy: Option<String> = None;
+                let mut triggered_direction: Option<String> = None;
 
-                    let fallback_snapshot: Option<MarketSnapshot> = if exec_snapshot.is_none() {
-                        let ps2 = poly_state.read().await;
-                        let s = ps2.active_markets.get(&poly_sym)
-                            .and_then(|a| ps2.snapshots.get(&a.condition_id))
-                            .cloned();
-                        drop(ps2);
-                        s
+                // ── Directional strategy check ──
+                if directional_cfg.enabled && timing_ok && pvo_bps.abs() > directional_cfg.directional_threshold_bps {
+                    let direction = if pvo_bps > 0.0 { "Up" } else { "Down" };
+                    let fair_value_up = estimate_fair_value_up(pvo_bps, dir_sensitivity);
+                    let (target_ask, fair_value) = if direction == "Up" {
+                        (snap_ref.up_best_ask, fair_value_up)
                     } else {
-                        None
+                        (snap_ref.down_best_ask, 1.0 - fair_value_up)
                     };
 
-                    let used_snapshot = exec_snapshot.as_ref().or(fallback_snapshot.as_ref());
+                    if let Some(ask) = target_ask {
+                        if ask < directional_cfg.max_entry_price && ask < fair_value {
+                            // Check cooldown
+                            let cd_key = (poly_sym.clone(), direction.to_string());
+                            let cooldown_ok = cooldowns
+                                .get(&cd_key)
+                                .map_or(true, |&last| ts_now.saturating_sub(last) > directional_cfg.cooldown_secs * 1000);
 
-                    let exec_up_ask = used_snapshot
-                        .and_then(|s| s.up_best_ask)
-                        .unwrap_or(up_ask_price);
-                    let exec_down_ask = used_snapshot
-                        .and_then(|s| s.down_best_ask)
-                        .unwrap_or(down_ask_price);
+                            if cooldown_ok {
+                                let ts_decision_end = now_ms();
+                                let elapsed = decision_start.elapsed();
+                                let ts_mock_order = ts_decision_end + latency_cfg.simulated_order_delay_ms;
+                                let fee = polymarket_fee(ask, fees_cfg.rate, fees_cfg.exponent);
+                                let total_cost = ask * directional_cfg.trade_size + fee * directional_cfg.trade_size;
+                                let edge_bps = (fair_value - ask) * 10_000.0;
 
-                    // Check available depth
-                    let empty_levels = Vec::new();
-                    let exec_up_levels = used_snapshot.map(|s| &s.up_ask_levels).unwrap_or(&empty_levels);
-                    let exec_down_levels = used_snapshot.map(|s| &s.down_ask_levels).unwrap_or(&empty_levels);
-                    let up_depth: f64 = exec_up_levels.iter().map(|l| l.size).sum();
-                    let down_depth: f64 = exec_down_levels.iter().map(|l| l.size).sum();
+                                let signal = DirectionalSignal {
+                                    symbol: poly_sym.clone(),
+                                    strategy: "directional".to_string(),
+                                    direction: direction.to_string(),
+                                    binance_mid: tick.mid_price,
+                                    window_open_price: open_price,
+                                    price_vs_open_bps: pvo_bps,
+                                    momentum_short_bps: momentum_short,
+                                    momentum_medium_bps: momentum_medium,
+                                    trend_strength: trend,
+                                    spike_bps: spike,
+                                    poly_ask_price: ask,
+                                    poly_quote_age_ms: quote_age_ms,
+                                    estimated_fair_value: fair_value,
+                                    edge_bps,
+                                    ts_signal: ts_now,
+                                    ts_decision_start,
+                                    ts_decision_end,
+                                    decision_duration_us: elapsed.as_micros() as u64,
+                                };
+                                let _ = signal_tx.send(signal);
 
-                    // Apply slippage to execution prices
-                    let up_exec_price = exec_up_ask * (1.0 + slippage_bps / 10_000.0);
-                    let down_exec_price = exec_down_ask * (1.0 + slippage_bps / 10_000.0);
-                    let combined_exec = up_exec_price + down_exec_price;
+                                let mut st = app_state.write().await;
+                                let trade_id = st.next_trade_id;
+                                st.next_trade_id += 1;
 
-                    // Compute fees
-                    let up_fee = trade_size * up_exec_price * taker_fee_bps / 10_000.0;
-                    let down_fee = trade_size * down_exec_price * taker_fee_bps / 10_000.0;
-                    let total_fee = up_fee + down_fee;
+                                let mock_trade = MockTrade {
+                                    id: trade_id,
+                                    symbol: poly_sym.clone(),
+                                    condition_id: condition_id.clone(),
+                                    strategy: "directional".to_string(),
+                                    direction: direction.to_string(),
+                                    entry_price: ask,
+                                    entry_price_with_slippage: ask,
+                                    fee_per_share: fee,
+                                    trade_size: directional_cfg.trade_size,
+                                    total_cost,
+                                    estimated_fair_value: fair_value,
+                                    edge_bps,
+                                    price_vs_open_bps: pvo_bps,
+                                    spike_bps: spike,
+                                    poly_quote_age_ms: quote_age_ms,
+                                    ts_binance_receive: tick.ts_receive,
+                                    ts_poly_last_update: ts_poly,
+                                    ts_decision_start,
+                                    ts_decision_end,
+                                    ts_mock_order,
+                                    simulated_order_delay_ms: latency_cfg.simulated_order_delay_ms,
+                                    window_start,
+                                    window_end,
+                                    settled: false,
+                                    resolved_winner: None,
+                                    won: None,
+                                    payout: None,
+                                    realized_profit: None,
+                                };
 
-                    // Compute profitability
-                    let expected_profit_gross = (1.0 - combined_exec) * trade_size;
-                    let expected_profit_net = expected_profit_gross - total_fee;
-                    let edge_positive = expected_profit_net > 0.0;
+                                info!(
+                                    "DIRECTIONAL #{}: {} {} ask={:.4} fv={:.4} edge={:.1}bps pvo={:.1}bps",
+                                    trade_id, poly_sym, direction, ask, fair_value, edge_bps, pvo_bps
+                                );
 
-                    // Build evaluation with full details
+                                st.mock_trades.push(mock_trade.clone());
+                                drop(st);
+
+                                let _ = trade_tx.send(mock_trade);
+                                cooldowns.insert(cd_key, ts_now);
+                                trade_triggered = true;
+                                triggered_strategy = Some("directional".to_string());
+                                triggered_direction = Some(direction.to_string());
+                            }
+                        }
+                    }
+                }
+
+                // ── Sniping strategy check ──
+                if sniping_cfg.enabled && !trade_triggered {
+                    if let Some(spike_val) = spike {
+                        if spike_val.abs() > sniping_cfg.spike_threshold_bps {
+                            let direction = if spike_val > 0.0 { "Up" } else { "Down" };
+                            let fair_value_up = estimate_fair_value_up(pvo_bps, snipe_sensitivity);
+                            let (target_ask, fair_value) = if direction == "Up" {
+                                (snap_ref.up_best_ask, fair_value_up)
+                            } else {
+                                (snap_ref.down_best_ask, 1.0 - fair_value_up)
+                            };
+
+                            if let Some(ask) = target_ask {
+                                if ask < sniping_cfg.max_entry_price && ask < fair_value {
+                                    let ts_decision_end = now_ms();
+                                    let elapsed = decision_start.elapsed();
+                                    let ts_mock_order = ts_decision_end + latency_cfg.simulated_order_delay_ms;
+                                    let fee = polymarket_fee(ask, fees_cfg.rate, fees_cfg.exponent);
+                                    let total_cost = ask * sniping_cfg.trade_size + fee * sniping_cfg.trade_size;
+                                    let edge_bps = (fair_value - ask) * 10_000.0;
+
+                                    let signal = DirectionalSignal {
+                                        symbol: poly_sym.clone(),
+                                        strategy: "sniping".to_string(),
+                                        direction: direction.to_string(),
+                                        binance_mid: tick.mid_price,
+                                        window_open_price: open_price,
+                                        price_vs_open_bps: pvo_bps,
+                                        momentum_short_bps: momentum_short,
+                                        momentum_medium_bps: momentum_medium,
+                                        trend_strength: trend,
+                                        spike_bps: Some(spike_val),
+                                        poly_ask_price: ask,
+                                        poly_quote_age_ms: quote_age_ms,
+                                        estimated_fair_value: fair_value,
+                                        edge_bps,
+                                        ts_signal: ts_now,
+                                        ts_decision_start,
+                                        ts_decision_end,
+                                        decision_duration_us: elapsed.as_micros() as u64,
+                                    };
+                                    let _ = signal_tx.send(signal);
+
+                                    let mut st = app_state.write().await;
+                                    let trade_id = st.next_trade_id;
+                                    st.next_trade_id += 1;
+
+                                    let mock_trade = MockTrade {
+                                        id: trade_id,
+                                        symbol: poly_sym.clone(),
+                                        condition_id: condition_id.clone(),
+                                        strategy: "sniping".to_string(),
+                                        direction: direction.to_string(),
+                                        entry_price: ask,
+                                        entry_price_with_slippage: ask,
+                                        fee_per_share: fee,
+                                        trade_size: sniping_cfg.trade_size,
+                                        total_cost,
+                                        estimated_fair_value: fair_value,
+                                        edge_bps,
+                                        price_vs_open_bps: pvo_bps,
+                                        spike_bps: Some(spike_val),
+                                        poly_quote_age_ms: quote_age_ms,
+                                        ts_binance_receive: tick.ts_receive,
+                                        ts_poly_last_update: ts_poly,
+                                        ts_decision_start,
+                                        ts_decision_end,
+                                        ts_mock_order,
+                                        simulated_order_delay_ms: latency_cfg.simulated_order_delay_ms,
+                                        window_start,
+                                        window_end,
+                                        settled: false,
+                                        resolved_winner: None,
+                                        won: None,
+                                        payout: None,
+                                        realized_profit: None,
+                                    };
+
+                                    info!(
+                                        "SNIPING #{}: {} {} ask={:.4} fv={:.4} edge={:.1}bps spike={:.1}bps age={}ms",
+                                        trade_id, poly_sym, direction, ask, fair_value, edge_bps, spike_val, quote_age_ms
+                                    );
+
+                                    st.mock_trades.push(mock_trade.clone());
+                                    drop(st);
+
+                                    let _ = trade_tx.send(mock_trade);
+                                    trade_triggered = true;
+                                    triggered_strategy = Some("sniping".to_string());
+                                    triggered_direction = Some(direction.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Log evaluation only when near threshold or trade triggered
+                let should_log = trade_triggered || pvo_bps.abs() > 15.0 || spike.map_or(false, |s| s.abs() > 10.0);
+                if should_log {
+                    let ts_decision_end = now_ms();
+                    let elapsed = decision_start.elapsed();
+                    let combined = match (snap_ref.up_best_ask, snap_ref.down_best_ask) {
+                        (Some(u), Some(d)) => Some(u + d),
+                        _ => None,
+                    };
                     let eval = Evaluation {
                         timestamp: ts_decision_start,
                         symbol: poly_sym.clone(),
                         binance_mid: tick.mid_price,
-                        up_best_ask: up_ask,
-                        down_best_ask: down_ask,
+                        up_best_ask: snap_ref.up_best_ask,
+                        down_best_ask: snap_ref.down_best_ask,
                         combined_ask: combined,
-                        combined_exec: Some(combined_exec),
-                        expected_profit_gross: Some(expected_profit_gross),
-                        expected_profit_net: Some(expected_profit_net),
-                        edge_positive,
-                        up_depth_available: Some(up_depth),
-                        down_depth_available: Some(down_depth),
-                        simulated_order_delay_ms,
-                        trade_triggered: true,
+                        price_vs_open_bps: price_vs_open,
+                        spike_bps: spike,
+                        direction: triggered_direction,
+                        strategy: triggered_strategy,
+                        trade_triggered,
                         ts_binance_receive: tick.ts_receive,
-                        ts_poly_last_update: ts_poly,
+                        ts_poly_last_update: Some(ts_poly),
                         ts_decision_start,
                         ts_decision_end,
                         binance_to_decision_us: ts_decision_start.saturating_sub(tick.ts_receive) * 1000,
-                        poly_to_decision_us: ts_poly.map(|t| ts_decision_start.saturating_sub(t) * 1000),
-                        decision_duration_us: elapsed.as_micros() as u64,
-                    };
-                    let _ = eval_tx.send(eval);
-
-                    // Log trade regardless of edge_positive
-                    let mut st = app_state.write().await;
-                    let trade_id = st.next_trade_id;
-                    st.next_trade_id += 1;
-
-                    let mock_trade = MockTrade {
-                        id: trade_id,
-                        symbol: poly_sym.clone(),
-                        condition_id: condition_id.clone(),
-                        up_ask_price,
-                        down_ask_price,
-                        combined_ask,
-                        trade_size,
-                        up_exec_price,
-                        down_exec_price,
-                        combined_exec,
-                        up_fee,
-                        down_fee,
-                        total_fee,
-                        expected_profit_gross,
-                        expected_profit_net,
-                        edge_positive,
-                        simulated_order_delay_ms,
-                        ts_binance_receive: tick.ts_receive,
-                        ts_poly_last_update: ts_poly.unwrap_or(0),
-                        ts_decision_start,
-                        ts_decision_end,
-                        ts_mock_order,
-                        window_start,
-                        window_end,
-                        settled: false,
-                        winning_outcome: None,
-                        realized_profit: None,
-                        resolved_winner: None,
-                    };
-
-                    info!(
-                        "TRADE #{}: {} combined_ask={:.4} exec={:.4} gross={:.4} net={:.4} edge={}",
-                        trade_id, poly_sym, combined_ask, combined_exec,
-                        expected_profit_gross, expected_profit_net, edge_positive
-                    );
-
-                    st.mock_trades.push(mock_trade.clone());
-                    drop(st);
-
-                    let _ = trade_tx.send(mock_trade);
-                } else {
-                    // No trade triggered — simpler evaluation
-                    let eval = Evaluation {
-                        timestamp: ts_decision_start,
-                        symbol: poly_sym.clone(),
-                        binance_mid: tick.mid_price,
-                        up_best_ask: up_ask,
-                        down_best_ask: down_ask,
-                        combined_ask: combined,
-                        combined_exec: None,
-                        expected_profit_gross: None,
-                        expected_profit_net: None,
-                        edge_positive: false,
-                        up_depth_available: None,
-                        down_depth_available: None,
-                        simulated_order_delay_ms,
-                        trade_triggered: false,
-                        ts_binance_receive: tick.ts_receive,
-                        ts_poly_last_update: ts_poly,
-                        ts_decision_start,
-                        ts_decision_end,
-                        binance_to_decision_us: ts_decision_start.saturating_sub(tick.ts_receive) * 1000,
-                        poly_to_decision_us: ts_poly.map(|t| ts_decision_start.saturating_sub(t) * 1000),
+                        poly_to_decision_us: Some(ts_decision_start.saturating_sub(ts_poly) * 1000),
                         decision_duration_us: elapsed.as_micros() as u64,
                     };
                     let _ = eval_tx.send(eval);
@@ -303,7 +402,7 @@ pub async fn run_strategy(
     }
 }
 
-/// Handle market resolutions and settle open trades.
+/// Handle market resolutions and settle open trades (single-side).
 pub async fn run_settlement(
     mut resolution_rx: broadcast::Receiver<crate::types::MarketResolution>,
     app_state: SharedState,
@@ -324,28 +423,46 @@ pub async fn run_settlement(
                 let mut st = app_state.write().await;
                 let mut total_pnl_delta = 0.0_f64;
                 let mut settled_ids = Vec::new();
+
                 for trade in st.mock_trades.iter_mut() {
                     if trade.condition_id == resolution.condition_id && !trade.settled {
                         trade.settled = true;
-                        trade.winning_outcome = Some(resolution.winning_outcome.clone());
                         trade.resolved_winner = Some(resolution.winning_outcome.clone());
+                        let won = trade.direction == resolution.winning_outcome;
+                        trade.won = Some(won);
 
-                        // Payout: winner side pays 1.0 per share
-                        // Entry cost uses execution prices (with slippage)
-                        let payout = trade.trade_size * 1.0;
-                        let entry_cost = (trade.up_exec_price + trade.down_exec_price) * trade.trade_size;
-                        let realized_profit = payout - entry_cost - trade.total_fee;
-                        trade.realized_profit = Some(realized_profit);
-                        total_pnl_delta += realized_profit;
-                        settled_ids.push((trade.id, realized_profit));
+                        if won {
+                            let payout = 1.0 * trade.trade_size;
+                            let profit = payout - trade.total_cost;
+                            trade.payout = Some(payout);
+                            trade.realized_profit = Some(profit);
+                            total_pnl_delta += profit;
+                            settled_ids.push((trade.id, trade.strategy.clone(), trade.direction.clone(), profit, true));
+                        } else {
+                            let loss = 0.0 - trade.total_cost;
+                            trade.payout = Some(0.0);
+                            trade.realized_profit = Some(loss);
+                            total_pnl_delta += loss;
+                            settled_ids.push((trade.id, trade.strategy.clone(), trade.direction.clone(), loss, false));
+                        }
                     }
                 }
+
                 st.pnl += total_pnl_delta;
                 let current_pnl = st.pnl;
-                for (tid, pnl) in settled_ids {
+                let wins = settled_ids.iter().filter(|(_, _, _, _, w)| *w).count();
+                let total = settled_ids.len();
+
+                for (tid, strat, dir, pnl, won) in &settled_ids {
                     info!(
-                        "SETTLED trade #{}: outcome={} realized_pnl={:.4} total_pnl={:.4}",
-                        tid, resolution.winning_outcome, pnl, current_pnl
+                        "SETTLED #{}: {} {} {} won={} pnl={:.4} total_pnl={:.4}",
+                        tid, strat, dir, resolution.winning_outcome, won, pnl, current_pnl
+                    );
+                }
+                if total > 0 {
+                    info!(
+                        "Settlement batch: {}/{} won, delta={:.4}, session_pnl={:.4}",
+                        wins, total, total_pnl_delta, current_pnl
                     );
                 }
             }

@@ -45,40 +45,63 @@ pub struct ActiveMarket {
     pub window_end: u64,
 }
 
-/// A paper trade record.
+/// Signal emitted when a directional or sniping trade fires.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectionalSignal {
+    pub symbol: String,
+    pub strategy: String,
+    pub direction: String,
+    pub binance_mid: f64,
+    pub window_open_price: f64,
+    pub price_vs_open_bps: f64,
+    pub momentum_short_bps: Option<f64>,
+    pub momentum_medium_bps: Option<f64>,
+    pub trend_strength: i32,
+    pub spike_bps: Option<f64>,
+    pub poly_ask_price: f64,
+    pub poly_quote_age_ms: u64,
+    pub estimated_fair_value: f64,
+    pub edge_bps: f64,
+    pub ts_signal: u64,
+    pub ts_decision_start: u64,
+    pub ts_decision_end: u64,
+    pub decision_duration_us: u64,
+}
+
+/// A single-side paper trade record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MockTrade {
     pub id: u64,
     pub symbol: String,
     pub condition_id: String,
-    pub up_ask_price: f64,
-    pub down_ask_price: f64,
-    pub combined_ask: f64,
+    pub strategy: String,
+    pub direction: String,
+    pub entry_price: f64,
+    pub entry_price_with_slippage: f64,
+    pub fee_per_share: f64,
     pub trade_size: f64,
-    pub up_exec_price: f64,
-    pub down_exec_price: f64,
-    pub combined_exec: f64,
-    pub up_fee: f64,
-    pub down_fee: f64,
-    pub total_fee: f64,
-    pub expected_profit_gross: f64,
-    pub expected_profit_net: f64,
-    pub edge_positive: bool,
-    pub simulated_order_delay_ms: u64,
+    pub total_cost: f64,
+    pub estimated_fair_value: f64,
+    pub edge_bps: f64,
+    pub price_vs_open_bps: f64,
+    pub spike_bps: Option<f64>,
+    pub poly_quote_age_ms: u64,
     pub ts_binance_receive: u64,
     pub ts_poly_last_update: u64,
     pub ts_decision_start: u64,
     pub ts_decision_end: u64,
     pub ts_mock_order: u64,
+    pub simulated_order_delay_ms: u64,
     pub window_start: u64,
     pub window_end: u64,
     pub settled: bool,
-    pub winning_outcome: Option<String>,
-    pub realized_profit: Option<f64>,
     pub resolved_winner: Option<String>,
+    pub won: Option<bool>,
+    pub payout: Option<f64>,
+    pub realized_profit: Option<f64>,
 }
 
-/// A strategy evaluation record (logged for every tick).
+/// A strategy evaluation record (logged selectively — near-threshold or trade events).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Evaluation {
     pub timestamp: u64,
@@ -87,13 +110,10 @@ pub struct Evaluation {
     pub up_best_ask: Option<f64>,
     pub down_best_ask: Option<f64>,
     pub combined_ask: Option<f64>,
-    pub combined_exec: Option<f64>,
-    pub expected_profit_gross: Option<f64>,
-    pub expected_profit_net: Option<f64>,
-    pub edge_positive: bool,
-    pub up_depth_available: Option<f64>,
-    pub down_depth_available: Option<f64>,
-    pub simulated_order_delay_ms: u64,
+    pub price_vs_open_bps: Option<f64>,
+    pub spike_bps: Option<f64>,
+    pub direction: Option<String>,
+    pub strategy: Option<String>,
     pub trade_triggered: bool,
     pub ts_binance_receive: u64,
     pub ts_poly_last_update: Option<u64>,
